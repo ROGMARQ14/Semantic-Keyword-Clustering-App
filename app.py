@@ -12,7 +12,7 @@ from io import StringIO
 
 st.set_page_config(page_title="Keyword Clustering Tool", layout="wide")
 
-st.title("Semantic Keyword Clustering App")
+st.title("Semantic Keyword Clustering")
 
 # Sidebar controls
 st.sidebar.header("Settings")
@@ -62,40 +62,58 @@ def get_model(model_name: str):
         model = SentenceTransformer(model_name)
     return model
 
-def create_chart(df, chart_type):
+def create_chart(df, chart_type, has_volume=False):
     """Create a sunburst chart or a treemap."""
+    # Determine values column based on volume availability
+    values_column = 'cluster_volume' if has_volume and 'cluster_volume' in df.columns else 'cluster_size'
+    
     if chart_type == "sunburst":
         fig = px.sunburst(
             df, 
             path=['hub', 'spoke'], 
-            values='cluster_size',
+            values=values_column,
             color_discrete_sequence=px.colors.qualitative.Pastel2
         )
     else:  # treemap
         fig = px.treemap(
             df, 
             path=['hub', 'spoke'], 
-            values='cluster_size',
+            values=values_column,
             color_discrete_sequence=px.colors.qualitative.Pastel2
         )
+    
+    # Update title based on values column
+    title = "Clusters by Search Volume" if values_column == 'cluster_volume' else "Clusters by Keyword Count"
+    fig.update_layout(title_text=title)
     
     st.plotly_chart(fig, use_container_width=True)
     return fig
 
-def process_keywords(df, column_name):
+def process_keywords(df, column_name, volume_column=None):
     """Process the keywords and create clusters."""
     if column_name not in df.columns:
         st.error(f"The column name '{column_name}' is not in the uploaded file.")
         return None
 
-    df.rename(columns={column_name: 'keyword'}, inplace=True)
+    # Create a copy of the dataframe with required columns
+    working_df = df[[column_name]].copy()
+    if volume_column and volume_column in df.columns:
+        working_df[volume_column] = df[volume_column]
+        # Convert volume to numeric, replacing any non-numeric values with 0
+        working_df[volume_column] = pd.to_numeric(working_df[volume_column], errors='coerce').fillna(0)
+    
+    working_df.rename(columns={column_name: 'keyword'}, inplace=True)
 
     if REMOVE_DUPES:
-        df.drop_duplicates(subset='keyword', inplace=True)
+        if volume_column:
+            # If removing duplicates with volume, keep the one with highest volume
+            working_df = working_df.sort_values(volume_column, ascending=False).drop_duplicates(subset='keyword')
+        else:
+            working_df.drop_duplicates(subset='keyword', inplace=True)
 
-    df = df[df["keyword"].notna()]
-    df['keyword'] = df['keyword'].astype(str)
-    from_list = df['keyword'].to_list()
+    working_df = working_df[working_df["keyword"].notna()]
+    working_df['keyword'] = working_df['keyword'].astype(str)
+    from_list = working_df['keyword'].to_list()
 
     with st.spinner("Clustering keywords..."):
         embedding_model = SentenceTransformer(MODEL_NAME)
@@ -107,25 +125,36 @@ def process_keywords(df, column_name):
 
     df_cluster = model.get_matches()
     df_cluster.rename(columns={"From": "keyword", "Similarity": "similarity", "Group": "spoke"}, inplace=True)
-    df = pd.merge(df, df_cluster[['keyword', 'spoke']], on='keyword', how='left')
+    working_df = pd.merge(working_df, df_cluster[['keyword', 'spoke', 'similarity']], on='keyword', how='left')
 
-    df['cluster_size'] = df['spoke'].map(df.groupby('spoke')['spoke'].count())
-    df.loc[df["cluster_size"] == 1, "spoke"] = "no_cluster"
-    df.insert(0, 'spoke', df.pop('spoke'))
-    df['spoke'] = df['spoke'].str.encode('ascii', 'ignore').str.decode('ascii')
+    # Calculate cluster metrics
+    if volume_column:
+        working_df['cluster_size'] = working_df.groupby('spoke')['spoke'].transform('count')
+        working_df['cluster_volume'] = working_df.groupby('spoke')[volume_column].transform('sum')
+    else:
+        working_df['cluster_size'] = working_df['spoke'].map(working_df.groupby('spoke')['spoke'].count())
+    
+    working_df.loc[working_df["cluster_size"] == 1, "spoke"] = "no_cluster"
+    working_df.insert(0, 'spoke', working_df.pop('spoke'))
+    working_df['spoke'] = working_df['spoke'].str.encode('ascii', 'ignore').str.decode('ascii')
 
-    df['keyword_len'] = df['keyword'].astype(str).apply(len)
-    df = df.sort_values(by="keyword_len", ascending=True)
+    working_df['keyword_len'] = working_df['keyword'].astype(str).apply(len)
+    working_df = working_df.sort_values(by="keyword_len", ascending=True)
 
-    df.insert(0, 'hub', df['spoke'].apply(create_unigram))
+    working_df.insert(0, 'hub', working_df['spoke'].apply(create_unigram))
 
-    df = df[['hub', 'spoke', 'cluster_size'] + 
-            [col for col in df.columns if col not in ['hub', 'spoke', 'cluster_size']]]
+    # Reorder columns based on whether volume exists
+    base_columns = ['hub', 'spoke', 'cluster_size']
+    if volume_column:
+        base_columns.extend(['cluster_volume', volume_column])
+    
+    remaining_columns = [col for col in working_df.columns if col not in base_columns]
+    working_df = working_df[base_columns + remaining_columns]
 
-    df.sort_values(["spoke", "cluster_size"], ascending=[True, False], inplace=True)
-    df['spoke'] = (df['spoke'].str.split()).str.join(' ')
+    working_df.sort_values(["spoke", "cluster_size"], ascending=[True, False], inplace=True)
+    working_df['spoke'] = (working_df['spoke'].str.split()).str.join(' ')
 
-    return df
+    return working_df
 
 # File upload
 uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
@@ -137,16 +166,38 @@ if uploaded_file is not None:
         st.success("File uploaded successfully!")
         
         # Show available columns
+        st.subheader("Column Selection")
+        
+        # Try to automatically detect keyword and volume columns
+        keyword_col_options = [col for col in df.columns if col.lower() in ['keyword', 'keywords', 'term', 'terms']]
+        volume_col_options = [col for col in df.columns if col.lower() in ['search volume', 'volume', 'vol', 'search_volume']]
+        
+        # Default to first found or let user select
+        default_keyword_idx = 0 if not keyword_col_options else df.columns.get_loc(keyword_col_options[0])
         column_name = st.selectbox(
             "Select the keyword column",
-            options=df.columns.tolist()
+            options=df.columns.tolist(),
+            index=default_keyword_idx
         )
-
+        
+        # Volume column is optional
+        has_volume = False
+        if len(volume_col_options) > 0:
+            default_volume_idx = df.columns.get_loc(volume_col_options[0])
+            volume_col_options = ['None'] + df.columns.tolist()
+            volume_column = st.selectbox(
+                "Select the search volume column (optional)",
+                options=volume_col_options,
+                index=default_volume_idx + 1  # +1 because we added 'None' at the beginning
+            )
+            has_volume = volume_column != 'None'
+        
         if st.button("Start Clustering"):
             start_time = time.time()
             
             # Process the keywords
-            result_df = process_keywords(df, column_name)
+            volume_col = volume_column if has_volume else None
+            result_df = process_keywords(df, column_name, volume_col)
             
             if result_df is not None:
                 processing_time = time.time() - start_time
@@ -154,7 +205,7 @@ if uploaded_file is not None:
 
                 # Create and display the visualization
                 st.subheader("Cluster Visualization")
-                fig = create_chart(result_df, CHART_TYPE)
+                fig = create_chart(result_df, CHART_TYPE, has_volume)
 
                 # Display statistics
                 st.subheader("Clustering Statistics")
@@ -166,6 +217,17 @@ if uploaded_file is not None:
                 col1.metric("Total Keywords", total_keywords)
                 col2.metric("Total Clusters", total_clusters)
                 col3.metric("Unclustered Keywords", unclustered)
+
+                if has_volume:
+                    st.subheader("Volume Statistics")
+                    total_volume = result_df[volume_column].sum()
+                    avg_volume = total_volume / total_keywords if total_keywords > 0 else 0
+                    max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_column].sum().max()
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Search Volume", f"{total_volume:,.0f}")
+                    col2.metric("Average Volume per Keyword", f"{avg_volume:,.0f}")
+                    col3.metric("Largest Cluster Volume", f"{max_cluster_volume:,.0f}")
 
                 # Download buttons
                 st.subheader("Download Results")
