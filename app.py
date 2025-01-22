@@ -166,46 +166,30 @@ if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
         st.success("File uploaded successfully!")
         
-        # Show available columns
-        st.subheader("Column Selection")
+        # Simple column selection
+        st.subheader("Select Columns")
         
-        # Try to automatically detect keyword and volume columns
-        keyword_col_options = [col for col in df.columns if col.lower() in ['keyword', 'keywords', 'term', 'terms']]
-        volume_col_options = [col for col in df.columns if col.lower() in ['search volume', 'volume', 'vol', 'search_volume']]
-        
-        # Default to first found or let user select
-        default_keyword_idx = 0 if not keyword_col_options else df.columns.get_loc(keyword_col_options[0])
-        column_name = st.selectbox(
-            "Select the keyword column",
-            options=df.columns.tolist(),
-            index=default_keyword_idx
+        # Keyword column selection
+        keyword_col = st.selectbox(
+            "Select the column containing your keywords",
+            options=df.columns.tolist()
         )
         
-        # Volume column is optional
-        has_volume = False
-        volume_column = None
-        if len(df.columns) > 1:  # Only show volume selection if there's more than one column
-            volume_col_options = ['None'] + df.columns.tolist()
-            default_volume_idx = 0
-            if volume_col_options:
-                try:
-                    default_volume_idx = volume_col_options.index(next((col for col in volume_col_options if any(vol in col.lower() for vol in ['search volume', 'volume', 'vol', 'search_volume'])), 'None'))
-                except:
-                    pass
-            
-            volume_column = st.selectbox(
-                "Select the search volume column (optional)",
-                options=volume_col_options,
-                index=default_volume_idx
-            )
-            has_volume = volume_column != 'None'
-
+        # Volume column selection (optional)
+        volume_options = ['None'] + [col for col in df.columns if col != keyword_col]
+        volume_col = st.selectbox(
+            "Select the search volume column (optional)",
+            options=volume_options
+        )
+        
+        has_volume = volume_col != 'None'
+        
         if st.button("Start Clustering"):
             start_time = time.time()
             
             # Process the keywords
-            volume_col = volume_column if has_volume else None
-            result_df = process_keywords(df, column_name, volume_col)
+            vol_col = volume_col if has_volume else None
+            result_df = process_keywords(df, keyword_col, vol_col)
             
             if result_df is not None:
                 processing_time = time.time() - start_time
@@ -228,9 +212,9 @@ if uploaded_file is not None:
 
                 if has_volume:
                     st.subheader("Volume Statistics")
-                    total_volume = result_df[volume_column].sum()
+                    total_volume = result_df[volume_col].sum()
                     avg_volume = total_volume / total_keywords if total_keywords > 0 else 0
-                    max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_column].sum().max()
+                    max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_col].sum().max()
                     
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Total Search Volume", f"{total_volume:,.0f}")
