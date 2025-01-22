@@ -9,7 +9,7 @@ from polyfuzz.models import SentenceEmbeddings
 import plotly.express as px
 import plotly.io as pio
 
-st.set_page_config(page_title="Keyword Clustering Tool", layout="wide")
+st.set_page_config(page_title="Keyword Clustering Tool App", layout="wide")
 
 st.title("Semantic Keyword Clustering")
 
@@ -34,7 +34,7 @@ MIN_SIMILARITY = st.sidebar.slider(
     "Minimum Similarity Threshold",
     min_value=0.5,
     max_value=1.0,
-    value=0.85,
+    value=0.90,
     step=0.05
 )
 
@@ -155,92 +155,134 @@ def process_keywords(df, column_name, volume_column=None):
 
     return working_df
 
+def read_file(uploaded_file):
+    """Read either CSV or Excel file with proper handling of delimiters."""
+    file_type = uploaded_file.name.split('.')[-1].lower()
+    
+    if file_type == 'csv':
+        # Try different delimiters
+        try:
+            # First try to read with pandas auto delimiter detection
+            df = pd.read_csv(uploaded_file, sep=None, engine='python')
+        except:
+            try:
+                # Try with specific delimiters
+                for delimiter in [',', ';', '|', '\t']:
+                    try:
+                        df = pd.read_csv(uploaded_file, sep=delimiter)
+                        if len(df.columns) > 1:  # Successfully found correct delimiter
+                            break
+                    except:
+                        continue
+            except:
+                st.error("Could not read the CSV file. Please check the file format.")
+                return None
+    elif file_type in ['xlsx', 'xls']:
+        try:
+            df = pd.read_excel(uploaded_file)
+        except:
+            st.error("Could not read the Excel file. Please check the file format.")
+            return None
+    else:
+        st.error("Unsupported file format. Please upload a CSV or Excel file.")
+        return None
+    
+    # Clean column names
+    df.columns = df.columns.str.strip()
+    
+    return df
+
 # Main app layout
-st.write("Upload your CSV file containing keywords and optional search volume data.")
+st.write("Upload your CSV or Excel file containing keywords and optional search volume data.")
 
 # File upload
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx', 'xls'])
 
 if uploaded_file is not None:
     try:
-        df = pd.read_csv(uploaded_file)
-        st.success("File uploaded successfully!")
-        
-        # Simple column selection
-        st.subheader("Select Columns")
-        
-        # Keyword column selection
-        keyword_col = st.selectbox(
-            "Select the column containing your keywords",
-            options=df.columns.tolist()
-        )
-        
-        # Volume column selection (optional)
-        volume_options = ['None'] + [col for col in df.columns if col != keyword_col]
-        volume_col = st.selectbox(
-            "Select the search volume column (optional)",
-            options=volume_options
-        )
-        
-        has_volume = volume_col != 'None'
-        
-        if st.button("Start Clustering"):
-            start_time = time.time()
+        df = read_file(uploaded_file)
+        if df is not None:
+            st.success("File uploaded successfully!")
             
-            # Process the keywords
-            vol_col = volume_col if has_volume else None
-            result_df = process_keywords(df, keyword_col, vol_col)
+            # Simple column selection
+            st.subheader("Select Columns")
             
-            if result_df is not None:
-                processing_time = time.time() - start_time
-                st.success(f"Clustering completed in {processing_time:.2f} seconds!")
-
-                # Create and display the visualization
-                st.subheader("Cluster Visualization")
-                fig = create_chart(result_df, CHART_TYPE, has_volume)
-
-                # Display statistics
-                st.subheader("Clustering Statistics")
-                total_keywords = len(result_df)
-                total_clusters = len(result_df[result_df['spoke'] != 'no_cluster']['spoke'].unique())
-                unclustered = len(result_df[result_df['spoke'] == 'no_cluster'])
+            # Display preview of the data
+            st.write("Preview of your data:")
+            st.dataframe(df.head())
+            
+            # Keyword column selection
+            keyword_col = st.selectbox(
+                "Select the column containing your keywords",
+                options=df.columns.tolist()
+            )
+            
+            # Volume column selection (optional)
+            volume_options = ['None'] + [col for col in df.columns if col != keyword_col]
+            volume_col = st.selectbox(
+                "Select the search volume column (optional)",
+                options=volume_options
+            )
+            
+            has_volume = volume_col != 'None'
+            
+            if st.button("Start Clustering"):
+                start_time = time.time()
                 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Keywords", total_keywords)
-                col2.metric("Total Clusters", total_clusters)
-                col3.metric("Unclustered Keywords", unclustered)
+                # Process the keywords
+                vol_col = volume_col if has_volume else None
+                result_df = process_keywords(df, keyword_col, vol_col)
+                
+                if result_df is not None:
+                    processing_time = time.time() - start_time
+                    st.success(f"Clustering completed in {processing_time:.2f} seconds!")
 
-                if has_volume:
-                    st.subheader("Volume Statistics")
-                    total_volume = result_df[volume_col].sum()
-                    avg_volume = total_volume / total_keywords if total_keywords > 0 else 0
-                    max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_col].sum().max()
+                    # Create and display the visualization
+                    st.subheader("Cluster Visualization")
+                    fig = create_chart(result_df, CHART_TYPE, has_volume)
+
+                    # Display statistics
+                    st.subheader("Clustering Statistics")
+                    total_keywords = len(result_df)
+                    total_clusters = len(result_df[result_df['spoke'] != 'no_cluster']['spoke'].unique())
+                    unclustered = len(result_df[result_df['spoke'] == 'no_cluster'])
                     
                     col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Search Volume", f"{total_volume:,.0f}")
-                    col2.metric("Average Volume per Keyword", f"{avg_volume:,.0f}")
-                    col3.metric("Largest Cluster Volume", f"{max_cluster_volume:,.0f}")
+                    col1.metric("Total Keywords", total_keywords)
+                    col2.metric("Total Clusters", total_clusters)
+                    col3.metric("Unclustered Keywords", unclustered)
 
-                # Download buttons
-                st.subheader("Download Results")
-                
-                # CSV download
-                csv = result_df.to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv,
-                    file_name="clustered_keywords.csv",
-                    mime="text/csv"
-                )
-                
-                # HTML chart download
-                html_bytes = pio.to_html(fig, include_plotlyjs=True)
-                st.download_button(
-                    label="Download Interactive Chart",
-                    data=html_bytes,
-                    file_name=f"keyword_clusters_{CHART_TYPE}.html",
-                    mime="text/html"
-                )
+                    if has_volume:
+                        st.subheader("Volume Statistics")
+                        total_volume = result_df[volume_col].sum()
+                        avg_volume = total_volume / total_keywords if total_keywords > 0 else 0
+                        max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_col].sum().max()
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Total Search Volume", f"{total_volume:,.0f}")
+                        col2.metric("Average Volume per Keyword", f"{avg_volume:,.0f}")
+                        col3.metric("Largest Cluster Volume", f"{max_cluster_volume:,.0f}")
+
+                    # Download buttons
+                    st.subheader("Download Results")
+                    
+                    # CSV download
+                    csv = result_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv,
+                        file_name="clustered_keywords.csv",
+                        mime="text/csv"
+                    )
+                    
+                    # HTML chart download
+                    html_bytes = pio.to_html(fig, include_plotlyjs=True)
+                    st.download_button(
+                        label="Download Interactive Chart",
+                        data=html_bytes,
+                        file_name=f"keyword_clusters_{CHART_TYPE}.html",
+                        mime="text/html"
+                    )
 
     except Exception as e:
         st.error(f"Error processing file: {str(e)}")
