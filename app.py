@@ -8,7 +8,6 @@ from polyfuzz import PolyFuzz
 from polyfuzz.models import SentenceEmbeddings
 import plotly.express as px
 import plotly.io as pio
-from io import StringIO
 
 st.set_page_config(page_title="Keyword Clustering Tool", layout="wide")
 
@@ -156,11 +155,13 @@ def process_keywords(df, column_name, volume_column=None):
 
     return working_df
 
+# Main app layout
+st.write("Upload your CSV file containing keywords and optional search volume data.")
+
 # File upload
 uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
 
 if uploaded_file is not None:
-    # Read the CSV file
     try:
         df = pd.read_csv(uploaded_file)
         st.success("File uploaded successfully!")
@@ -182,16 +183,23 @@ if uploaded_file is not None:
         
         # Volume column is optional
         has_volume = False
-        if len(volume_col_options) > 0:
-            default_volume_idx = df.columns.get_loc(volume_col_options[0])
+        volume_column = None
+        if len(df.columns) > 1:  # Only show volume selection if there's more than one column
             volume_col_options = ['None'] + df.columns.tolist()
+            default_volume_idx = 0
+            if volume_col_options:
+                try:
+                    default_volume_idx = volume_col_options.index(next((col for col in volume_col_options if any(vol in col.lower() for vol in ['search volume', 'volume', 'vol', 'search_volume'])), 'None'))
+                except:
+                    pass
+            
             volume_column = st.selectbox(
                 "Select the search volume column (optional)",
                 options=volume_col_options,
-                index=default_volume_idx + 1  # +1 because we added 'None' at the beginning
+                index=default_volume_idx
             )
             has_volume = volume_column != 'None'
-        
+
         if st.button("Start Clustering"):
             start_time = time.time()
             
