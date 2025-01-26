@@ -1,299 +1,421 @@
+# Standard library imports
+import datetime
+import base64
+
+# Related third-party imports
 import streamlit as st
-import time
+from streamlit_elements import Elements
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
 import pandas as pd
-import os
-from collections import Counter
-from sentence_transformers import SentenceTransformer
-from polyfuzz import PolyFuzz
-from polyfuzz.models import SentenceEmbeddings
-import plotly.express as px
-import plotly.io as pio
+import searchconsole
 
-st.set_page_config(page_title="Keyword Clustering Tool App", layout="wide")
+# Configuration: Set to True if running locally, False if running on Streamlit Cloud
+# IS_LOCAL = True
+IS_LOCAL = False
 
-st.title("Semantic Keyword Clustering")
+# Constants
+SEARCH_TYPES = ["web", "image", "video", "news", "discover", "googleNews"]
+DATE_RANGE_OPTIONS = [
+    "Last 7 Days",
+    "Last 30 Days",
+    "Last 3 Months",
+    "Last 6 Months",
+    "Last 12 Months",
+    "Last 16 Months",
+    "Custom Range"
+]
+DEVICE_OPTIONS = ["All Devices", "desktop", "mobile", "tablet"]
+BASE_DIMENSIONS = ["page", "query", "country", "date"]
+MAX_ROWS = 1_000_000
+DF_PREVIEW_ROWS = 100
 
-# Sidebar controls
-st.sidebar.header("Settings")
 
-# Model selection
-MODEL_OPTIONS = {
-    "Fast (Lower Accuracy)": "paraphrase-MiniLM-L3-v2",
-    "Balanced": "all-MiniLM-L6-v2",
-    "Accurate (Slower)": "all-mpnet-base-v2"
-}
-selected_model = st.sidebar.selectbox(
-    "Select Model",
-    options=list(MODEL_OPTIONS.keys()),
-    index=0
-)
-MODEL_NAME = MODEL_OPTIONS[selected_model]
+# -------------
+# Data Formatting Functions
+# -------------
 
-# Similarity threshold
-MIN_SIMILARITY = st.sidebar.slider(
-    "Minimum Similarity Threshold",
-    min_value=0.5,
-    max_value=1.0,
-    value=0.90,
-    step=0.05
-)
-
-# Chart type selection
-CHART_TYPE = st.sidebar.selectbox(
-    "Visualization Type",
-    options=["treemap", "sunburst"],
-    index=0
-)
-
-# Remove duplicates option
-REMOVE_DUPES = st.sidebar.checkbox("Remove Duplicates", value=True)
-
-def create_unigram(cluster: str):
-    """Create unigram from the cluster and return the most common word."""
-    words = cluster.split()
-    most_common_word = Counter(words).most_common(1)[0][0]
-    return most_common_word
-
-@st.cache_resource
-def get_model(model_name: str):
-    """Create and return a SentenceTransformer model."""
-    with st.spinner("Loading the model..."):
-        model = SentenceTransformer(model_name)
-    return model
-
-def create_chart(df, chart_type, has_volume=False):
-    """Create a sunburst chart or a treemap."""
-    # Determine values column based on volume availability
-    values_column = 'cluster_volume' if has_volume and 'cluster_volume' in df.columns else 'cluster_size'
-    
-    if chart_type == "sunburst":
-        fig = px.sunburst(
-            df, 
-            path=['hub', 'spoke'], 
-            values=values_column,
-            color_discrete_sequence=px.colors.qualitative.Pastel2
-        )
-    else:  # treemap
-        fig = px.treemap(
-            df, 
-            path=['hub', 'spoke'], 
-            values=values_column,
-            color_discrete_sequence=px.colors.qualitative.Pastel2
-        )
-    
-    # Update title based on values column
-    title = "Clusters by Search Volume" if values_column == 'cluster_volume' else "Clusters by Keyword Count"
-    fig.update_layout(title_text=title)
-    
-    st.plotly_chart(fig, use_container_width=True)
-    return fig
-
-def process_keywords(df, column_name, volume_column=None):
-    """Process the keywords and create clusters."""
-    if column_name not in df.columns:
-        st.error(f"The column name '{column_name}' is not in the uploaded file.")
-        return None
-
-    # Create a copy of the dataframe with required columns
-    working_df = df[[column_name]].copy()
-    if volume_column and volume_column in df.columns:
-        working_df[volume_column] = df[volume_column]
-        # Convert volume to numeric, replacing any non-numeric values with 0
-        working_df[volume_column] = pd.to_numeric(working_df[volume_column], errors='coerce').fillna(0)
-    
-    working_df.rename(columns={column_name: 'keyword'}, inplace=True)
-
-    if REMOVE_DUPES:
-        if volume_column:
-            # If removing duplicates with volume, keep the one with highest volume
-            working_df = working_df.sort_values(volume_column, ascending=False).drop_duplicates(subset='keyword')
-        else:
-            working_df.drop_duplicates(subset='keyword', inplace=True)
-
-    working_df = working_df[working_df["keyword"].notna()]
-    working_df['keyword'] = working_df['keyword'].astype(str)
-    from_list = working_df['keyword'].to_list()
-
-    with st.spinner("Clustering keywords..."):
-        embedding_model = SentenceTransformer(MODEL_NAME)
-        distance_model = SentenceEmbeddings(embedding_model)
-
-        model = PolyFuzz(distance_model)
-        model = model.fit(from_list)
-        model.group(link_min_similarity=MIN_SIMILARITY)
-
-    df_cluster = model.get_matches()
-    df_cluster.rename(columns={"From": "keyword", "Similarity": "similarity", "Group": "spoke"}, inplace=True)
-    working_df = pd.merge(working_df, df_cluster[['keyword', 'spoke', 'similarity']], on='keyword', how='left')
-
-    # Calculate cluster metrics
-    if volume_column:
-        working_df['cluster_size'] = working_df.groupby('spoke')['spoke'].transform('count')
-        working_df['cluster_volume'] = working_df.groupby('spoke')[volume_column].transform('sum')
-    else:
-        working_df['cluster_size'] = working_df['spoke'].map(working_df.groupby('spoke')['spoke'].count())
-    
-    working_df.loc[working_df["cluster_size"] == 1, "spoke"] = "no_cluster"
-    working_df.insert(0, 'spoke', working_df.pop('spoke'))
-    working_df['spoke'] = working_df['spoke'].str.encode('ascii', 'ignore').str.decode('ascii')
-
-    working_df['keyword_len'] = working_df['keyword'].astype(str).apply(len)
-    working_df = working_df.sort_values(by="keyword_len", ascending=True)
-
-    working_df.insert(0, 'hub', working_df['spoke'].apply(create_unigram))
-
-    # Reorder columns based on whether volume exists
-    base_columns = ['hub', 'spoke', 'cluster_size']
-    if volume_column:
-        base_columns.extend(['cluster_volume', volume_column])
-    
-    remaining_columns = [col for col in working_df.columns if col not in base_columns]
-    working_df = working_df[base_columns + remaining_columns]
-
-    working_df.sort_values(["spoke", "cluster_size"], ascending=[True, False], inplace=True)
-    working_df['spoke'] = (working_df['spoke'].str.split()).str.join(' ')
-
-    return working_df
-
-def read_file(uploaded_file):
-    """Read either CSV or Excel file with proper handling of delimiters."""
-    file_type = uploaded_file.name.split('.')[-1].lower()
-    
-    if file_type == 'csv':
-        # Try different delimiters
-        try:
-            # First try to read with pandas auto delimiter detection
-            df = pd.read_csv(uploaded_file, sep=None, engine='python')
-        except:
-            try:
-                # Try with specific delimiters
-                for delimiter in [',', ';', '|', '\t']:
-                    try:
-                        df = pd.read_csv(uploaded_file, sep=delimiter)
-                        if len(df.columns) > 1:  # Successfully found correct delimiter
-                            break
-                    except:
-                        continue
-            except:
-                st.error("Could not read the CSV file. Please check the file format.")
-                return None
-    elif file_type in ['xlsx', 'xls']:
-        try:
-            df = pd.read_excel(uploaded_file)
-        except:
-            st.error("Could not read the Excel file. Please check the file format.")
-            return None
-    else:
-        st.error("Unsupported file format. Please upload a CSV or Excel file.")
-        return None
-    
-    # Clean column names
-    df.columns = df.columns.str.strip()
+def format_gsc_data(df):
+    """
+    Formats the Google Search Console data with proper formatting for CTR and Average Position.
+    """
+    if not df.empty:
+        # Format CTR as percentage
+        if 'ctr' in df.columns:
+            df['ctr'] = df['ctr'].apply(lambda x: f"{x*100:.2f}%" if pd.notnull(x) else "0.00%")
+        
+        # Format average position to 2 decimal places
+        if 'position' in df.columns:
+            df['position'] = df['position'].apply(lambda x: f"{x:.2f}" if pd.notnull(x) else "0.00")
     
     return df
 
-# Main app layout
-st.write("Upload your CSV or Excel file containing keywords and optional search volume data.")
 
-# File upload
-uploaded_file = st.file_uploader("Choose a file", type=['csv', 'xlsx', 'xls'])
+# -------------
+# Streamlit App Configuration
+# -------------
 
-if uploaded_file is not None:
+def setup_streamlit():
+    """
+    Configures Streamlit's page settings and displays the app title and markdown information.
+    Sets the page layout, title, and markdown content with links and app description.
+    """
+    st.set_page_config(page_title="✨ Simple Google Search Console Data | LeeFoot.co.uk", layout="wide")
+    st.title("✨ Simple Google Search Console Data | June 2024")
+    st.markdown(f"### Lightweight GSC Data Extractor. (Max {MAX_ROWS:,} Rows)")
+
+    st.markdown(
+        """
+        <p>
+            Created by <a href="https://twitter.com/LeeFootSEO" target="_blank">LeeFootSEO</a> |
+            <a href="https://leefoot.co.uk" target="_blank">More Apps & Scripts on my Website</a>
+        """,
+        unsafe_allow_html=True
+    )
+    st.divider()
+
+
+def init_session_state():
+    """
+    Initialises or updates the Streamlit session state variables for property selection,
+    search type, date range, dimensions, and device type.
+    """
+    if 'selected_property' not in st.session_state:
+        st.session_state.selected_property = None
+    if 'selected_search_type' not in st.session_state:
+        st.session_state.selected_search_type = 'web'
+    if 'selected_date_range' not in st.session_state:
+        st.session_state.selected_date_range = 'Last 7 Days'
+    if 'start_date' not in st.session_state:
+        st.session_state.start_date = datetime.date.today() - datetime.timedelta(days=7)
+    if 'end_date' not in st.session_state:
+        st.session_state.end_date = datetime.date.today()
+    if 'selected_dimensions' not in st.session_state:
+        st.session_state.selected_dimensions = ['page', 'query']
+    if 'selected_device' not in st.session_state:
+        st.session_state.selected_device = 'All Devices'
+    if 'custom_start_date' not in st.session_state:
+        st.session_state.custom_start_date = datetime.date.today() - datetime.timedelta(days=7)
+    if 'custom_end_date' not in st.session_state:
+        st.session_state.custom_end_date = datetime.date.today()
+
+
+# -------------
+# Google Authentication Functions
+# -------------
+
+def load_config():
+    """
+    Loads the Google API client configuration from Streamlit secrets.
+    Returns a dictionary with the client configuration for OAuth.
+    """
+    client_config = {
+        "installed": {
+            "client_id": str(st.secrets["installed"]["client_id"]),
+            "client_secret": str(st.secrets["installed"]["client_secret"]),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://accounts.google.com/o/oauth2/token",
+            "redirect_uris": (
+                ["http://localhost:8501"]
+                if IS_LOCAL
+                else [str(st.secrets["installed"]["redirect_uris"][0])]
+            ),
+        }
+    }
+    return client_config
+
+
+def init_oauth_flow(client_config):
+    """
+    Initialises the OAuth flow for Google API authentication using the client configuration.
+    Sets the necessary scopes and returns the configured Flow object.
+    """
+    scopes = ["https://www.googleapis.com/auth/webmasters"]
+    return Flow.from_client_config(
+        client_config,
+        scopes=scopes,
+        redirect_uri=client_config["installed"]["redirect_uris"][0],
+    )
+
+
+def google_auth(client_config):
+    """
+    Starts the Google authentication process using OAuth.
+    Generates and returns the OAuth flow and the authentication URL.
+    """
+    flow = init_oauth_flow(client_config)
+    auth_url, _ = flow.authorization_url(prompt="consent")
+    return flow, auth_url
+
+
+def auth_search_console(client_config, credentials):
+    """
+    Authenticates the user with the Google Search Console API using provided credentials.
+    Returns an authenticated searchconsole client.
+    """
+    token = {
+        "token": credentials.token,
+        "refresh_token": credentials.refresh_token,
+        "token_uri": credentials.token_uri,
+        "client_id": credentials.client_id,
+        "client_secret": credentials.client_secret,
+        "scopes": credentials.scopes,
+        "id_token": getattr(credentials, "id_token", None),
+    }
+    return searchconsole.authenticate(client_config=client_config, credentials=token)
+
+
+# -------------
+# Data Fetching Functions
+# -------------
+
+def list_gsc_properties(credentials):
+    """
+    Lists all Google Search Console properties accessible with the given credentials.
+    Returns a list of property URLs or a message if no properties are found.
+    """
+    service = build('webmasters', 'v3', credentials=credentials)
+    site_list = service.sites().list().execute()
+    return [site['siteUrl'] for site in site_list.get('siteEntry', [])] or ["No properties found"]
+
+
+def fetch_gsc_data(webproperty, search_type, start_date, end_date, dimensions, device_type=None):
+    """
+    Fetches Google Search Console data for a specified property, date range, dimensions, and device type.
+    Handles errors and returns the data as a DataFrame.
+    """
+    query = webproperty.query.range(start_date, end_date).search_type(search_type).dimension(*dimensions)
+
+    if 'device' in dimensions and device_type and device_type != 'All Devices':
+        query = query.filter('device', 'equals', device_type.lower())
+
     try:
-        df = read_file(uploaded_file)
-        if df is not None:
-            st.success("File uploaded successfully!")
-            
-            # Simple column selection
-            st.subheader("Select Columns")
-            
-            # Display preview of the data
-            st.write("Preview of your data:")
-            st.dataframe(df.head())
-            
-            # Keyword column selection
-            keyword_col = st.selectbox(
-                "Select the column containing your keywords",
-                options=df.columns.tolist()
-            )
-            
-            # Volume column selection (optional)
-            volume_options = ['None'] + [col for col in df.columns if col != keyword_col]
-            volume_col = st.selectbox(
-                "Select the search volume column (optional)",
-                options=volume_options
-            )
-            
-            has_volume = volume_col != 'None'
-            
-            if st.button("Start Clustering"):
-                start_time = time.time()
-                
-                # Process the keywords
-                vol_col = volume_col if has_volume else None
-                result_df = process_keywords(df, keyword_col, vol_col)
-                
-                if result_df is not None:
-                    processing_time = time.time() - start_time
-                    st.success(f"Clustering completed in {processing_time:.2f} seconds!")
-
-                    # Create and display the visualization
-                    st.subheader("Cluster Visualization")
-                    fig = create_chart(result_df, CHART_TYPE, has_volume)
-
-                    # Display statistics
-                    st.subheader("Clustering Statistics")
-                    total_keywords = len(result_df)
-                    total_clusters = len(result_df[result_df['spoke'] != 'no_cluster']['spoke'].unique())
-                    unclustered = len(result_df[result_df['spoke'] == 'no_cluster'])
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Keywords", total_keywords)
-                    col2.metric("Total Clusters", total_clusters)
-                    col3.metric("Unclustered Keywords", unclustered)
-
-                    if has_volume:
-                        st.subheader("Volume Statistics")
-                        total_volume = result_df[volume_col].sum()
-                        avg_volume = total_volume / total_keywords if total_keywords > 0 else 0
-                        max_cluster_volume = result_df[result_df['spoke'] != 'no_cluster'].groupby('spoke')[volume_col].sum().max()
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Total Search Volume", f"{total_volume:,.0f}")
-                        col2.metric("Average Volume per Keyword", f"{avg_volume:,.0f}")
-                        col3.metric("Largest Cluster Volume", f"{max_cluster_volume:,.0f}")
-
-                    # Download buttons
-                    st.subheader("Download Results")
-                    
-                    # CSV download
-                    csv = result_df.to_csv(index=False)
-                    st.download_button(
-                        label="Download CSV",
-                        data=csv,
-                        file_name="clustered_keywords.csv",
-                        mime="text/csv"
-                    )
-                    
-                    # HTML chart download
-                    html_bytes = pio.to_html(fig, include_plotlyjs=True)
-                    st.download_button(
-                        label="Download Interactive Chart",
-                        data=html_bytes,
-                        file_name=f"keyword_clusters_{CHART_TYPE}.html",
-                        mime="text/html"
-                    )
-
+        df = query.limit(MAX_ROWS).get().to_dataframe()
+        return format_gsc_data(df)  # Format the data before returning
     except Exception as e:
-        st.error(f"Error processing file: {str(e)}")
+        show_error(e)
+        return pd.DataFrame()
 
-# Add installation instructions for Colab
-with st.expander("📝 Installation Instructions for Google Colab"):
-    st.code("""
-# Run these commands in a Colab cell before running the app
-!pip install streamlit polyfuzz sentence-transformers plotly
-!npm install localtunnel
 
-# In a new cell, save the code above as streamlit_app.py and run:
-!streamlit run streamlit_app.py & npx localtunnel --port 8501
-    """, language="bash")
+def fetch_data_loading(webproperty, search_type, start_date, end_date, dimensions, device_type=None):
+    """
+    Fetches Google Search Console data with a loading indicator. Utilises 'fetch_gsc_data' for data retrieval.
+    Returns the fetched data as a DataFrame.
+    """
+    with st.spinner('Fetching data...'):
+        return fetch_gsc_data(webproperty, search_type, start_date, end_date, dimensions, device_type)
+
+
+# -------------
+# Utility Functions
+# -------------
+
+def update_dimensions(selected_search_type):
+    """
+    Updates and returns the list of dimensions based on the selected search type.
+    Adds 'device' to dimensions if the search type requires it.
+    """
+    return BASE_DIMENSIONS + ['device'] if selected_search_type in SEARCH_TYPES else BASE_DIMENSIONS
+
+
+def calc_date_range(selection, custom_start=None, custom_end=None):
+    """
+    Calculates the date range based on the selected range option.
+    Returns the start and end dates for the specified range.
+    """
+    range_map = {
+        'Last 7 Days': 7,
+        'Last 30 Days': 30,
+        'Last 3 Months': 90,
+        'Last 6 Months': 180,
+        'Last 12 Months': 365,
+        'Last 16 Months': 480
+    }
+    today = datetime.date.today()
+    if selection == 'Custom Range':
+        if custom_start and custom_end:
+            return custom_start, custom_end
+        else:
+            return today - datetime.timedelta(days=7), today
+    return today - datetime.timedelta(days=range_map.get(selection, 0)), today
+
+
+def show_error(e):
+    """
+    Displays an error message in the Streamlit app.
+    Formats and shows the provided error 'e'.
+    """
+    st.error(f"An error occurred: {e}")
+
+
+def property_change():
+    """
+    Updates the 'selected_property' in the Streamlit session state.
+    Triggered on change of the property selection.
+    """
+    st.session_state.selected_property = st.session_state['selected_property_selector']
+
+
+# -------------
+# File & Download Operations
+# -------------
+
+def show_dataframe(report):
+    """
+    Shows a preview of the first 100 rows of the report DataFrame in an expandable section.
+    """
+    with st.expander("Preview the First 100 Rows"):
+        st.dataframe(report.head(DF_PREVIEW_ROWS))
+
+
+def download_csv_link(report):
+    """
+    Generates and displays a download link for the report DataFrame in CSV format.
+    """
+    def to_csv(df):
+        return df.to_csv(index=False, encoding='utf-8-sig')
+
+    csv = to_csv(report)
+    b64_csv = base64.b64encode(csv.encode()).decode()
+    href = f'<a href="data:file/csv;base64,{b64_csv}" download="search_console_data.csv">Download CSV File</a>'
+    st.markdown(href, unsafe_allow_html=True)
+
+
+# -------------
+# Streamlit UI Components
+# -------------
+
+def show_google_sign_in(auth_url):
+    """
+    Displays the Google sign-in button and authentication URL in the Streamlit sidebar.
+    """
+    with st.sidebar:
+        if st.button("Sign in with Google"):
+            st.write('Please click the link below to sign in:')
+            st.markdown(f'[Google Sign-In]({auth_url})', unsafe_allow_html=True)
+
+
+def show_property_selector(properties, account):
+    """
+    Displays a dropdown selector for Google Search Console properties.
+    Returns the selected property's webproperty object.
+    """
+    selected_property = st.selectbox(
+        "Select a Search Console Property:",
+        properties,
+        index=properties.index(
+            st.session_state.selected_property) if st.session_state.selected_property in properties else 0,
+        key='selected_property_selector',
+        on_change=property_change
+    )
+    return account[selected_property]
+
+
+def show_search_type_selector():
+    """
+    Displays a dropdown selector for choosing the search type.
+    Returns the selected search type.
+    """
+    return st.selectbox(
+        "Select Search Type:",
+        SEARCH_TYPES,
+        index=SEARCH_TYPES.index(st.session_state.selected_search_type),
+        key='search_type_selector'
+    )
+
+
+def show_date_range_selector():
+    """
+    Displays a dropdown selector for choosing the date range.
+    Returns the selected date range option.
+    """
+    return st.selectbox(
+        "Select Date Range:",
+        DATE_RANGE_OPTIONS,
+        index=DATE_RANGE_OPTIONS.index(st.session_state.selected_date_range),
+        key='date_range_selector'
+    )
+
+
+def show_custom_date_inputs():
+    """
+    Displays date input fields for custom date range selection.
+    Updates session state with the selected dates.
+    """
+    st.session_state.custom_start_date = st.date_input("Start Date", st.session_state.custom_start_date)
+    st.session_state.custom_end_date = st.date_input("End Date", st.session_state.custom_end_date)
+
+
+def show_dimensions_selector(search_type):
+    """
+    Displays a multi-select box for choosing dimensions based on the selected search type.
+    Returns the selected dimensions.
+    """
+    available_dimensions = update_dimensions(search_type)
+    return st.multiselect(
+        "Select Dimensions:",
+        available_dimensions,
+        default=st.session_state.selected_dimensions,
+        key='dimensions_selector'
+    )
+
+
+def show_fetch_data_button(webproperty, search_type, start_date, end_date, selected_dimensions):
+    """
+    Displays a button to fetch data based on selected parameters.
+    Shows the report DataFrame and download link upon successful data fetching.
+    """
+    if st.button("Fetch Data"):
+        report = fetch_data_loading(webproperty, search_type, start_date, end_date, selected_dimensions)
+
+        if report is not None and not report.empty:
+            show_dataframe(report)
+            download_csv_link(report)
+        else:
+            st.warning("No data found for the selected parameters.")
+
+
+# -------------
+# Main Streamlit App Function
+# -------------
+
+def main():
+    """
+    The main function for the Streamlit application.
+    Handles the app setup, authentication, UI components, and data fetching logic.
+    """
+    setup_streamlit()
+    client_config = load_config()
+    st.session_state.auth_flow, st.session_state.auth_url = google_auth(client_config)
+
+    query_params = st.experimental_get_query_params()
+    auth_code = query_params.get("code", [None])[0]
+
+    if auth_code and not st.session_state.get('credentials'):
+        st.session_state.auth_flow.fetch_token(code=auth_code)
+        st.session_state.credentials = st.session_state.auth_flow.credentials
+
+    if not st.session_state.get('credentials'):
+        show_google_sign_in(st.session_state.auth_url)
+    else:
+        init_session_state()
+        account = auth_search_console(client_config, st.session_state.credentials)
+        properties = list_gsc_properties(st.session_state.credentials)
+
+        if properties:
+            webproperty = show_property_selector(properties, account)
+            search_type = show_search_type_selector()
+            date_range_selection = show_date_range_selector()
+
+            if date_range_selection == 'Custom Range':
+                show_custom_date_inputs()
+                start_date, end_date = st.session_state.custom_start_date, st.session_state.custom_end_date
+            else:
+                start_date, end_date = calc_date_range(date_range_selection)
+
+            selected_dimensions = show_dimensions_selector(search_type)
+            show_fetch_data_button(webproperty, search_type, start_date, end_date, selected_dimensions)
+
+
+if __name__ == "__main__":
+    main()
